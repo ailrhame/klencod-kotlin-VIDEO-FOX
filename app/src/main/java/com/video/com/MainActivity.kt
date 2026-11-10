@@ -1,5 +1,6 @@
 package com.video.fox
 
+import com.google.mlkit.common.model.DownloadConditions
 import androidx.activity.ComponentActivity
 import android.app.AlertDialog
 import android.content.Context
