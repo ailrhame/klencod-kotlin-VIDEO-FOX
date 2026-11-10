@@ -3,31 +3,32 @@ package com.video.fox
 import androidx.activity.ComponentActivity
 import android.app.AlertDialog
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.RectF
-import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.text.InputType
-import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
-import android.widget.CheckBox
-import android.widget.ScrollView
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import android.widget.ScrollView
+import android.widget.CheckBox
+import android.widget.Spinner
+import android.widget.ArrayAdapter
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.view.setPadding
 import androidx.media3.common.MediaItem
@@ -45,43 +46,28 @@ import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.TextRecognizer
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
-import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import com.google.android.gms.tasks.Tasks
 import org.json.JSONObject
-import org.json.JSONArray
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
-import java.io.File
-import java.io.ByteArrayOutputStream
-import java.util.zip.ZipEntry
-import java.util.zip.ZipInputStream
-import java.util.zip.ZipOutputStream
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import android.media.MediaMetadataRetriever
 
-private data class VideoFoxCue(
-    var startMs: Long,
-    var endMs: Long,
-    var source: String,
-    var translated: String = "",
-    var language: String = "und"
-)
-
 /**
- * VIDEO FOX V2
-
+ * VIDEO FOX V1.0
  * @N5CR4
- * Video subtitle OCR, editable subtitle timeline, local knowledge, quality checks,
- * SRT/VTT export and safe project backup. @N5CR4
-
+ * Video subtitle OCR + contextual on-device translation + optional LibreTranslate fallback.
+ * V1 OCR recognizer uses ML Kit Latin script model. Additional script recognizers can be added later.
  */
 class MainActivity : ComponentActivity() {
     private val gold = Color.rgb(255, 184, 0)
@@ -102,10 +88,13 @@ class MainActivity : ComponentActivity() {
     private val frameExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val translationExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val frameBusy = AtomicBoolean(false)
-    private val latinRecognizer by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
-    private val japaneseRecognizer by lazy { TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build()) }
-    private val koreanRecognizer by lazy { TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build()) }
-    private val chineseRecognizer by lazy { TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build()) }
+    // Parallel script recognizers support mixed Latin/Japanese/Korean/Chinese subtitle frames.
+    private val recognizers: List<TextRecognizer> by lazy { listOf(
+        TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS),
+        TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build()),
+        TextRecognition.getClient(KoreanTextRecognizerOptions.Builder().build()),
+        TextRecognition.getClient(ChineseTextRecognizerOptions.Builder().build())
+    ) }
     private val languageIdentifier by lazy { LanguageIdentification.getClient() }
     private var translator: Translator? = null
     private var retriever: MediaMetadataRetriever? = null
@@ -113,8 +102,6 @@ class MainActivity : ComponentActivity() {
     private var region = RectF(0.08f, 0.72f, 0.92f, 0.96f) // normalized to video content
     private var regionChosen = false
     private var selectingRegion = false
-    private var appendSelectedRegion = false
-    private val regions = mutableListOf<RectF>()
     private var videoAspect = 16f / 9f
     private var candidateText = ""
     private var candidateHits = 0
@@ -125,72 +112,36 @@ class MainActivity : ComponentActivity() {
     private var scanEnabled = false
     private var remoteEndpoint = ""
     private var remoteApiKey = ""
+    private var aiEndpoint = ""
+    private var aiApiKey = ""
+    private var aiModel = ""
     private var preferRemote = false
     private var targetLanguage = "ar"
-    private var sourceOcrLanguage = "auto"
-    private val cues = mutableListOf<VideoFoxCue>()
-    private val cueUndo = ArrayDeque<String>()
-    private val cueRedo = ArrayDeque<String>()
-    private var pendingDocumentText = ""
-    private var pendingArchiveBytes: ByteArray? = null
-    private var customTypeface: Typeface? = null
-    private var hideOriginalSubtitle = false
-    private var autoFitSubtitle = true
-    private var lastCueStartMs = -1L
-    private val knowledgePrefs by lazy { getSharedPreferences("video_fox_knowledge", MODE_PRIVATE) }
+    private data class SubtitleCue(val startMs: Long, var endMs: Long, val source: String, var translated: String)
+    private val subtitleCues = mutableListOf<SubtitleCue>()
+    private var currentVideoName = "فيديو"
+    private var currentVideoKey = ""
+    private var lastSavedVideoUri = ""
+    private var glossary = linkedMapOf<String, String>()
+    private var subtitleFontSize = 17f
+    private var subtitleBackground = true
+    private var scanIntervalMs = 900L
+    private var translationStyle = "طبيعية وسياقية"
+    private val createSrt = registerForActivityResult(ActivityResultContracts.CreateDocument("application/x-subrip")) { uri ->
+        if (uri != null) exportSrt(uri)
+    }
 
     private val scanRunnable = object : Runnable {
         override fun run() {
-            if (::player.isInitialized && player.isPlaying && selectedUri != null) {
-                if (scanEnabled) captureAndRecognize(player.currentPosition)
-                updateOverlayForPlayback(player.currentPosition)
+            if (scanEnabled && ::player.isInitialized && player.isPlaying && selectedUri != null) {
+                captureAndRecognize(player.currentPosition)
             }
-            mainHandler.postDelayed(this, 650L)
+            mainHandler.postDelayed(this, scanIntervalMs)
         }
     }
 
     private val pickVideo = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) openVideo(uri)
-    }
-
-    private val exportSrt = registerForActivityResult(ActivityResultContracts.CreateDocument("application/x-subrip")) { uri ->
-        if (uri != null) runCatching {
-            contentResolver.openOutputStream(uri)?.bufferedWriter(Charsets.UTF_8)?.use { it.write(pendingDocumentText) }
-            toast("تم تصدير ملف SRT")
-        }.onFailure { toast("تعذر حفظ SRT: ${it.localizedMessage}") }
-    }
-    private val exportVtt = registerForActivityResult(ActivityResultContracts.CreateDocument("text/vtt")) { uri ->
-        if (uri != null) runCatching {
-            contentResolver.openOutputStream(uri)?.bufferedWriter(Charsets.UTF_8)?.use { it.write(pendingDocumentText) }
-            toast("تم تصدير ملف VTT")
-        }.onFailure { toast("تعذر حفظ VTT: ${it.localizedMessage}") }
-    }
-    private val exportProject = registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
-        val bytes = pendingArchiveBytes
-        if (uri != null && bytes != null) runCatching {
-            contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
-            toast("تم حفظ نسخة VIDEO FOX")
-        }.onFailure { toast("تعذر حفظ النسخة: ${it.localizedMessage}") }
-        pendingArchiveBytes = null
-    }
-    private val importProject = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) runCatching {
-            contentResolver.openInputStream(uri)?.use { restoreProject(it) }
-            refreshTimelineStatus()
-            toast("تم استيراد مشروع الفيديو")
-        }.onFailure { toast("فشل استيراد المشروع: ${it.localizedMessage}") }
-    }
-    private val importFont = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) runCatching {
-            contentResolver.openInputStream(uri)?.use { input ->
-                val target = File(filesDir, "video_fox_custom_font.ttf")
-                target.outputStream().use { input.copyTo(it) }
-                customTypeface = Typeface.createFromFile(target)
-                applySubtitleStyle()
-                getSharedPreferences("video_fox", MODE_PRIVATE).edit().putBoolean("custom_font", true).apply()
-                toast("تم استيراد الخط وتطبيقه")
-            }
-        }.onFailure { toast("تعذر فتح ملف الخط") }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -214,6 +165,7 @@ class MainActivity : ComponentActivity() {
             }
         })
         loadSettings()
+        applySubtitleStyle()
         mainHandler.post(scanRunnable)
     }
 
@@ -234,7 +186,9 @@ class MainActivity : ComponentActivity() {
             typeface = android.graphics.Typeface.DEFAULT_BOLD
         }
         header.addView(brand, LinearLayout.LayoutParams(0, dp(48), 1f))
-        val settings = button("⚙") { showRemoteSettings() }
+        val library = button("▤") { showLibrary() }
+        header.addView(library, LinearLayout.LayoutParams(dp(48), dp(44)))
+        val settings = button("⚙") { showFoxDashboard() }
         header.addView(settings, LinearLayout.LayoutParams(dp(48), dp(44)))
         root.addView(header)
 
@@ -242,6 +196,10 @@ class MainActivity : ComponentActivity() {
         root.addView(intro)
         val choose = button("اختيار فيديو من الهاتف") { pickVideo.launch(arrayOf("video/*")) }
         root.addView(choose, matchWrap())
+        val tools = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        tools.addView(button("تصدير SRT") { if (subtitleCues.isEmpty()) toast("لا توجد ترجمة لتصديرها") else createSrt.launch("${safeFileName(currentVideoName)}.srt") }, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginEnd = dp(4) })
+        tools.addView(button("استوديو الترجمة") { showSubtitleStudio() }, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginStart = dp(4) })
+        root.addView(tools, matchWrap())
 
         playerContainer = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         playerView = PlayerView(this).apply {
@@ -251,15 +209,11 @@ class MainActivity : ComponentActivity() {
         }
         playerContainer.addView(playerView, FrameLayout.LayoutParams(-1, -1))
         regionView = RegionSelectionView(this) { normalized ->
-            region = RectF(normalized)
-            if (!appendSelectedRegion) regions.clear()
-            regions.add(RectF(normalized))
+            region = normalized
             regionChosen = true
             selectingRegion = false
-            appendSelectedRegion = false
-            saveRegions()
             regionView.setSelectionMode(false)
-            status("تم حفظ منطقة OCR · ${regions.size} منطقة")
+            status("تم حفظ منطقة الترجمة")
         }
         playerContainer.addView(regionView, FrameLayout.LayoutParams(-1, -1))
         val subtitles = LinearLayout(this).apply {
@@ -287,8 +241,7 @@ class MainActivity : ComponentActivity() {
         })
 
         val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        actions.addView(button("تحديد منطقة النص") { beginRegionSelection(false) }, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(4) })
-        actions.addView(button("إضافة منطقة OCR") { beginRegionSelection(true) }, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(4); marginEnd = dp(4) })
+        actions.addView(button("تحديد منطقة النص") { beginRegionSelection() }, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginEnd = dp(6) })
         actions.addView(button("بدء / إيقاف الترجمة") {
             if (selectedUri == null) toast("اختر فيديو أولاً") else {
                 scanEnabled = !scanEnabled
@@ -297,45 +250,26 @@ class MainActivity : ComponentActivity() {
             }
         }, LinearLayout.LayoutParams(0, dp(48), 1f).apply { marginStart = dp(6) })
         root.addView(actions)
-
-        val toolsRow1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        toolsRow1.addView(button("الترجمة الزمنية") { showTimeline() }, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginEnd = dp(4) })
-        toolsRow1.addView(button("تصدير SRT") { exportSubtitles(false) }, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginStart = dp(4); marginEnd = dp(4) })
-        toolsRow1.addView(button("تصدير VTT") { exportSubtitles(true) }, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginStart = dp(4) })
-        root.addView(toolsRow1)
-
-        val toolsRow2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        toolsRow2.addView(button("المعرفة والقاموس") { showKnowledge() }, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginEnd = dp(4) })
-        toolsRow2.addView(button("فحص الجودة") { showQualityReport() }, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginStart = dp(4); marginEnd = dp(4) })
-        toolsRow2.addView(button("تراجع / إعادة") { showHistoryActions() }, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginStart = dp(4) })
-        root.addView(toolsRow2)
-
-        val toolsRow3 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        toolsRow3.addView(button("حفظ مشروع ZIP") { backupProject() }, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginEnd = dp(4) })
-        toolsRow3.addView(button("استيراد مشروع") { importProject.launch(arrayOf("application/zip", "application/octet-stream")) }, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginStart = dp(4); marginEnd = dp(4) })
-        toolsRow3.addView(button("الخط والمظهر") { showSubtitleAppearance() }, LinearLayout.LayoutParams(0, dp(42), 1f).apply { marginStart = dp(4) })
-        root.addView(toolsRow3)
-
         statusText = text("جاهز — اختر فيديو للبدء", 12f, muted).apply { setPadding(2, dp(8), 2, 0) }
         root.addView(statusText)
         setContentView(root)
     }
 
     private fun openVideo(uri: Uri) {
-        val sessionPrefs = getSharedPreferences("video_fox", MODE_PRIVATE)
-        val resumePosition = if (sessionPrefs.getString("last_video_uri", "") == uri.toString()) sessionPrefs.getLong("last_position_ms", 0L) else 0L
         selectedUri = uri
-        sessionPrefs.edit().putString("last_video_uri", uri.toString()).apply()
-        loadCuesForVideo(uri)
+        currentVideoName = queryDisplayName(uri) ?: "فيديو ${System.currentTimeMillis()}"
+        lastSavedVideoUri = uri.toString()
+        currentVideoKey = uri.toString().hashCode().toUInt().toString(16)
+        saveVideoToLibrary()
         try { contentResolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) { }
         player.setMediaItem(MediaItem.fromUri(uri))
         player.prepare()
-        if (resumePosition > 0L) player.seekTo(resumePosition)
         player.playWhenReady = true
         regionChosen = false
         region = RectF(0.08f, 0.72f, 0.92f, 0.96f)
-        loadRegions()
         resetSubtitleState()
+        subtitleCues.clear()
+        loadSubtitleCues()
         status("تم فتح الفيديو — حدد مكان الترجمة")
         frameExecutor.execute {
             try {
@@ -347,12 +281,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun beginRegionSelection(append: Boolean) {
+    private fun beginRegionSelection() {
         if (selectedUri == null) { toast("اختر فيديو أولاً"); return }
-        appendSelectedRegion = append
         selectingRegion = true
         regionView.setSelectionMode(true)
-        status(if (append) "ارسم منطقة OCR إضافية" else "اسحب إصبعك لرسم منطقة الترجمة الرئيسية")
+        status("اسحب إصبعك لرسم مستطيل حول الترجمة")
     }
 
     private fun startScanning() {
@@ -362,52 +295,46 @@ class MainActivity : ComponentActivity() {
     private fun captureAndRecognize(positionMs: Long) {
         if (!frameBusy.compareAndSet(false, true)) return
         frameExecutor.execute {
+            var handedOff = false
             var frameBitmap: Bitmap? = null
-            val crops = mutableListOf<Bitmap>()
+            var cropBitmap: Bitmap? = null
             try {
-                val sourceRetriever = retriever ?: throw IllegalStateException("مصدر الفيديو غير جاهز")
+                val sourceRetriever = retriever ?: return@execute
                 frameBitmap = sourceRetriever.getFrameAtTime(positionMs * 1000L, MediaMetadataRetriever.OPTION_CLOSEST)
-                    ?: throw IllegalStateException("تعذر استخراج إطار الفيديو")
+                    ?: return@execute
                 val source = frameBitmap!!
-                val activeRegions = if (regions.isEmpty()) listOf(region) else regions.toList()
-                activeRegions.forEach { rect ->
-                    val left = (rect.left * source.width).toInt().coerceIn(0, source.width - 1)
-                    val top = (rect.top * source.height).toInt().coerceIn(0, source.height - 1)
-                    val right = (rect.right * source.width).toInt().coerceIn(left + 1, source.width)
-                    val bottom = (rect.bottom * source.height).toInt().coerceIn(top + 1, source.height)
-                    crops.add(Bitmap.createBitmap(source, left, top, right - left, bottom - top))
+                val rect = RectF(region)
+                val left = (rect.left * source.width).toInt().coerceIn(0, source.width - 1)
+                val top = (rect.top * source.height).toInt().coerceIn(0, source.height - 1)
+                val right = (rect.right * source.width).toInt().coerceIn(left + 1, source.width)
+                val bottom = (rect.bottom * source.height).toInt().coerceIn(top + 1, source.height)
+                cropBitmap = Bitmap.createBitmap(source, left, top, right - left, bottom - top)
+                val frameForCleanup = frameBitmap
+                val cropForCleanup = cropBitmap!!
+                val input = InputImage.fromBitmap(cropForCleanup, 0)
+                val recognitionTasks = recognizers.map { engine ->
+                    engine.process(input).continueWith { task -> if (task.isSuccessful) task.result?.text.orEmpty() else "" }
                 }
-                val combined = StringBuilder()
-                fun processNext(index: Int) {
-                    if (index >= crops.size) {
-                        processRecognizedText(combined.toString(), positionMs)
-                        crops.forEach { runCatching { it.recycle() } }
-                        runCatching { source.recycle() }
-                        frameBusy.set(false)
-                        return
+                Tasks.whenAllSuccess<String>(recognitionTasks)
+                    .addOnSuccessListener { results ->
+                        val raw = results.filter { it.isNotBlank() }.distinct().joinToString(" ")
+                        processRecognizedText(raw, positionMs)
                     }
-                    selectedRecognizer().process(InputImage.fromBitmap(crops[index], 0))
-                        .addOnSuccessListener { result ->
-                            val text = result.textBlocks.joinToString(" ") { it.text }.trim()
-                            if (text.isNotBlank() && !combined.contains(text)) {
-                                if (combined.isNotEmpty()) combined.append(' ')
-                                combined.append(text)
-                            }
-                        }
-                        .addOnFailureListener { e ->
-                            mainHandler.post { status("OCR: ${e.localizedMessage ?: "تعذر التعرف"}") }
-                        }
-                        .addOnCompleteListener {
-                            runCatching { crops[index].recycle() }
-                            processNext(index + 1)
-                        }
-                }
-                processNext(0)
+                    .addOnFailureListener { e -> mainHandler.post { status("OCR: ${e.localizedMessage ?: "تعذر التعرف"}") } }
+                    .addOnCompleteListener {
+                        try { cropForCleanup.recycle() } catch (_: Exception) { }
+                        try { frameForCleanup?.recycle() } catch (_: Exception) { }
+                        frameBusy.set(false)
+                    }
+                handedOff = true
             } catch (e: Exception) {
-                crops.forEach { runCatching { it.recycle() } }
-                runCatching { frameBitmap?.recycle() }
                 mainHandler.post { status("خطأ تحليل الإطار: ${e.localizedMessage ?: "غير معروف"}") }
-                frameBusy.set(false)
+            } finally {
+                if (!handedOff) {
+                    try { cropBitmap?.recycle() } catch (_: Exception) { }
+                    try { frameBitmap?.recycle() } catch (_: Exception) { }
+                    frameBusy.set(false)
+                }
             }
         }
     }
@@ -416,8 +343,6 @@ class MainActivity : ComponentActivity() {
         val clean = raw.replace('\n', ' ').replace(Regex("\\s+"), " ").trim()
         if (clean.length < 2) {
             if (activeText.isNotEmpty()) {
-                cues.lastOrNull()?.takeIf { it.source.equals(activeText, true) }?.let { it.endMs = maxOf(it.startMs + 300L, positionMs) }
-                persistCues()
                 activeText = ""
                 mainHandler.post { originalSubtitle.text = ""; arabicSubtitle.text = "" }
             }
@@ -428,31 +353,17 @@ class MainActivity : ComponentActivity() {
             candidateHits = 1
         }
         // Require repeated recognition to reduce flicker and partial-frame OCR noise.
-        if (candidateHits < 2) return
-        if (clean.equals(activeText, ignoreCase = true)) {
-            cues.lastOrNull()?.takeIf { it.source.equals(clean, true) }?.let {
-                it.endMs = maxOf(it.endMs, positionMs + 850L)
-                persistCues()
-            }
-            return
-        }
+        if (candidateHits < 2 || clean.equals(activeText, ignoreCase = true)) return
         activeText = clean
         lastAcceptedAt = positionMs
-        if (cues.isNotEmpty() && cues.last().endMs >= positionMs - 1200L && cues.last().source.equals(clean, true)) {
-            cues.last().endMs = maxOf(cues.last().endMs, positionMs + 700L)
-        } else {
-            if (cues.isNotEmpty() && cues.last().endMs > positionMs) cues.last().endMs = positionMs
-            pushCueUndo()
-            cues.add(VideoFoxCue(positionMs, positionMs + 1200L, clean))
-            lastCueStartMs = positionMs
-        }
-        persistCues()
+        if (subtitleCues.isNotEmpty()) { subtitleCues.last().endMs = positionMs.coerceAtLeast(subtitleCues.last().startMs + 250); persistSubtitleCues() }
         contextLines.addLast(clean)
-        while (contextLines.size > 4) contextLines.removeFirst()
+        while (contextLines.size > 6) contextLines.removeFirst()
+        subtitleCues.add(SubtitleCue(positionMs, positionMs + 2500, clean, ""))
+        persistSubtitleCues()
         mainHandler.post {
             originalSubtitle.text = clean
             arabicSubtitle.text = "جارٍ الترجمة…"
-            applySubtitleStyle()
             status("تم اكتشاف نص جديد عند ${formatTime(positionMs)}")
         }
         translateSubtitle(clean, contextLines.toList())
@@ -460,17 +371,52 @@ class MainActivity : ComponentActivity() {
 
     private fun translateSubtitle(text: String, context: List<String>) {
         if (text.length > 500) return
-        exactGlossary(text)?.let { learned ->
-            updateCueTranslation(text, learned)
-            showTranslation(text, learned)
+        // Prefer a context-aware chat model when the user configures a compatible endpoint.
+        if (aiEndpoint.isNotBlank() && aiModel.isNotBlank()) {
+            contextualAiTranslate(context.distinct().takeLast(5), text) { result ->
+                if (result != null) showTranslation(text, result) else translateWithFallback(text, context)
+            }
             return
         }
+        translateWithFallback(text, context)
+    }
+
+    private fun translateWithFallback(text: String, context: List<String>) {
+        // Group nearby dialogue lines to preserve local context even in the offline translator.
         if (preferRemote && remoteEndpoint.isNotBlank()) {
-            remoteTranslate(text) { result ->
-                if (result != null) showTranslation(text, result) else localTranslate(text, context)
+            remoteTranslate(context.distinct().takeLast(4).joinToString("\n")) { result ->
+                if (result != null) showTranslation(text, result.lineSequence().lastOrNull().orEmpty()) else localTranslate(text, context)
             }
         } else {
             localTranslate(text, context)
+        }
+    }
+
+    private fun contextualAiTranslate(context: List<String>, current: String, callback: (String?) -> Unit) {
+        translationExecutor.execute {
+            var connection: HttpURLConnection? = null
+            try {
+                connection = (URL(aiEndpoint).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"; connectTimeout = 12000; readTimeout = 25000; doOutput = true
+                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                    if (aiApiKey.isNotBlank()) setRequestProperty("Authorization", "Bearer $aiApiKey")
+                }
+                val dialogue = context.joinToString("\n")
+                val style = translationStyle
+                val prompt = "ترجم الحوار التالي إلى العربية ترجمة أدبية طبيعية حسب المعنى والسياق، لا حرفياً. حافظ على نبرة الشخصية والمزاح والسخرية والتهديد والتعابير الاصطلاحية. لا تشرح ولا تضف كلاماً. أعد ترجمة السطر الأخير فقط. أسلوب الصياغة: $style.\nالسياق السابق والحالي:\n$dialogue\nالسطر المطلوب: $current"
+                val messages = org.json.JSONArray()
+                    .put(JSONObject().put("role", "system").put("content", "أنت مترجم حوارات محترف إلى العربية."))
+                    .put(JSONObject().put("role", "user").put("content", prompt))
+                val body = JSONObject().put("model", aiModel).put("messages", messages).put("temperature", 0.25)
+                OutputStreamWriter(connection.outputStream, Charsets.UTF_8).use { it.write(body.toString()) }
+                val code = connection.responseCode
+                val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+                val response = BufferedReader(InputStreamReader(stream, Charsets.UTF_8)).use { it.readText() }
+                val result = if (code in 200..299) JSONObject(response).optJSONArray("choices")?.optJSONObject(0)
+                    ?.optJSONObject("message")?.optString("content")?.trim()?.takeIf { it.isNotBlank() } else null
+                mainHandler.post { callback(result) }
+            } catch (_: Exception) { mainHandler.post { callback(null) } }
+            finally { connection?.disconnect() }
         }
     }
 
@@ -497,8 +443,9 @@ class MainActivity : ComponentActivity() {
                 mainHandler.post { status("تجهيز نموذج الترجمة المحلي: $language → $targetLanguage") }
                 engine.downloadModelIfNeeded(DownloadConditions.Builder().build())
                     .addOnSuccessListener {
-                        engine.translate(text)
-                            .addOnSuccessListener { translated -> showTranslation(text, translated) }
+                        val batch = context.distinct().takeLast(4).joinToString("\n").ifBlank { text }
+                engine.translate(batch)
+                            .addOnSuccessListener { translated -> showTranslation(text, translated.lineSequence().lastOrNull().orEmpty().ifBlank { translated }) }
                             .addOnFailureListener { fallbackRemoteOrMessage(text) }
                     }
                     .addOnFailureListener { fallbackRemoteOrMessage(text) }
@@ -545,422 +492,184 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun showTranslation(sourceText: String, value: String) {
-        lastTranslation = value
-        updateCueTranslation(sourceText, value)
+        val finalValue = applyGlossary(value)
+        lastTranslation = finalValue
+        subtitleCues.lastOrNull()?.takeIf { it.source == sourceText }?.translated = finalValue
+        persistSubtitleCues()
         mainHandler.post {
             // A slow response for an earlier subtitle must not overwrite the current one.
-            if (activeText == sourceText) arabicSubtitle.text = value
+            if (activeText == sourceText) arabicSubtitle.text = finalValue
         }
     }
 
-
-    private fun saveRegions() {
-        val array = JSONArray()
-        regions.forEach { r ->
-            array.put(JSONArray().put(r.left.toDouble()).put(r.top.toDouble()).put(r.right.toDouble()).put(r.bottom.toDouble()))
-        }
-        getSharedPreferences("video_fox", MODE_PRIVATE).edit()
-            .putString("ocr_regions", array.toString())
-            .putString("ocr_regions_video_uri", selectedUri?.toString().orEmpty()).apply()
+    private fun showFoxDashboard() {
+        val items = arrayOf("إعدادات محرك الترجمة", "الجودة وسرعة الالتقاط", "المعجم الشخصي", "استوديو الترجمة", "مكتبة الفيديو")
+        AlertDialog.Builder(this).setTitle("VIDEO FOX · مركز التحكم")
+            .setItems(items) { _, which -> when (which) {
+                0 -> showRemoteSettings()
+                1 -> showQualitySettings()
+                2 -> showGlossaryEditor()
+                3 -> showSubtitleStudio()
+                4 -> showLibrary()
+            } }.show()
     }
 
-    private fun loadRegions() {
-        val prefs = getSharedPreferences("video_fox", MODE_PRIVATE)
-        val savedFor = prefs.getString("ocr_regions_video_uri", "")
-        val raw = if (savedFor == selectedUri?.toString()) prefs.getString("ocr_regions", "[]") else "[]"
-        val array = runCatching { JSONArray(raw) }.getOrElse { JSONArray() }
-        regions.clear()
-        for (i in 0 until array.length()) {
-            val item = array.optJSONArray(i) ?: continue
-            if (item.length() < 4) continue
-            val left = item.optDouble(0, 0.08).toFloat().coerceIn(0f, 1f)
-            val top = item.optDouble(1, 0.72).toFloat().coerceIn(0f, 1f)
-            val right = item.optDouble(2, 0.92).toFloat().coerceIn(left + 0.01f, 1f)
-            val bottom = item.optDouble(3, 0.96).toFloat().coerceIn(top + 0.01f, 1f)
-            regions.add(RectF(left, top, right, bottom))
-        }
-        if (regions.isEmpty()) regions.add(RectF(region))
-        region = RectF(regions.last())
-    }
-
-    private fun updateOverlayForPlayback(positionMs: Long) {
-        val cue = cues.lastOrNull { positionMs >= it.startMs && positionMs <= it.endMs }
-        if (cue != null) {
-            if (originalSubtitle.text.toString() != cue.source) originalSubtitle.text = cue.source
-            val translated = cue.translated.ifBlank { "جارٍ تجهيز الترجمة…" }
-            if (arabicSubtitle.text.toString() != translated) arabicSubtitle.text = translated
-        } else if (activeText.isBlank() || cues.lastOrNull()?.let { positionMs > it.endMs } == true) {
-            if (originalSubtitle.text.isNotEmpty()) originalSubtitle.text = ""
-            if (arabicSubtitle.text.isNotEmpty()) arabicSubtitle.text = ""
-        }
-    }
-
-    private fun selectedRecognizer(): TextRecognizer = when (sourceOcrLanguage) {
-        "ja" -> japaneseRecognizer
-        "ko" -> koreanRecognizer
-        "zh" -> chineseRecognizer
-        else -> latinRecognizer
-    }
-
-    private fun updateCueTranslation(source: String, translated: String) {
-        val cue = cues.lastOrNull { it.source.equals(source, true) && it.translated.isBlank() }
-            ?: cues.lastOrNull { it.source.equals(source, true) }
-        if (cue != null) {
-            cue.translated = translated
-            persistCues()
-        }
-    }
-
-    private fun cuesJson(): JSONArray = JSONArray().also { array ->
-        cues.forEach { cue ->
-            array.put(JSONObject().put("start", cue.startMs).put("end", cue.endMs)
-                .put("source", cue.source).put("translated", cue.translated).put("language", cue.language))
-        }
-    }
-
-    private fun persistCues() {
-        runCatching {
-            getSharedPreferences("video_fox", MODE_PRIVATE).edit()
-                .putString("cues_json", cuesJson().toString())
-                .putString("cues_video_uri", selectedUri?.toString().orEmpty()).apply()
-        }
-    }
-
-    private fun loadCuesForVideo(uri: Uri) {
-        val prefs = getSharedPreferences("video_fox", MODE_PRIVATE)
-        cues.clear()
-        if (prefs.getString("cues_video_uri", "") == uri.toString()) {
-            runCatching {
-                val array = JSONArray(prefs.getString("cues_json", "[]"))
-                for (i in 0 until array.length()) {
-                    val item = array.optJSONObject(i) ?: continue
-                    val source = item.optString("source").trim()
-                    if (source.isNotBlank()) cues.add(VideoFoxCue(
-                        item.optLong("start"), item.optLong("end").coerceAtLeast(item.optLong("start") + 1),
-                        source, item.optString("translated"), item.optString("language", "und")
-                    ))
-                }
-            }
-        }
-        refreshTimelineStatus()
-    }
-
-    private fun refreshTimelineStatus() {
-        status(if (cues.isEmpty()) "جاهز — لا توجد مقاطع محفوظة بعد" else "المقاطع الزمنية المحفوظة: ${cues.size}")
-    }
-
-    private fun pushCueUndo() {
-        cueUndo.addLast(cuesJson().toString())
-        while (cueUndo.size > 20) cueUndo.removeFirst()
-        cueRedo.clear()
-    }
-
-    private fun restoreCueSnapshot(json: String) {
-        cues.clear()
-        val array = JSONArray(json)
-        for (i in 0 until array.length()) {
-            val o = array.optJSONObject(i) ?: continue
-            cues.add(VideoFoxCue(o.optLong("start"), o.optLong("end"), o.optString("source"), o.optString("translated"), o.optString("language", "und")))
-        }
-        persistCues()
-        refreshTimelineStatus()
-    }
-
-    private fun showHistoryActions() {
-        AlertDialog.Builder(this).setTitle("سجل التعديلات")
-            .setItems(arrayOf("تراجع عن آخر تعديل", "إعادة آخر تعديل")) { _, which ->
-                if (which == 0 && cueUndo.isNotEmpty()) {
-                    cueRedo.addLast(cuesJson().toString())
-                    restoreCueSnapshot(cueUndo.removeLast())
-                } else if (which == 1 && cueRedo.isNotEmpty()) {
-                    cueUndo.addLast(cuesJson().toString())
-                    restoreCueSnapshot(cueRedo.removeLast())
-                } else toast("لا توجد خطوة متاحة")
-            }.setNegativeButton("إغلاق", null).show()
-    }
-
-    private fun showTimeline() {
-        if (cues.isEmpty()) { toast("لا توجد مقاطع بعد — شغّل الترجمة أولاً"); return }
-        val labels = cues.mapIndexed { index, cue ->
-            "${index + 1}. ${formatTime(cue.startMs)} → ${formatTime(cue.endMs)}\n${cue.source.take(70)}\n↳ ${cue.translated.ifBlank { "بانتظار الترجمة" }.take(70)}"
-        }.toTypedArray()
-        AlertDialog.Builder(this).setTitle("الترجمة الزمنية · ${cues.size} مقطع")
-            .setItems(labels) { _, which -> editCue(which) }
-            .setPositiveButton("إغلاق", null)
-            .setNeutralButton("انتقال لأول مقطع") { _, _ ->
-                if (::player.isInitialized) player.seekTo(cues.firstOrNull()?.startMs ?: 0L)
-            }
-            .show()
-    }
-
-    private fun editCue(index: Int) {
-        val cue = cues.getOrNull(index) ?: return
-        val sourceInput = EditText(this).apply { setText(cue.source); hint = "النص الأصلي"; minLines = 2 }
-        val translatedInput = EditText(this).apply { setText(cue.translated); hint = "الترجمة العربية"; minLines = 2 }
-        val startInput = EditText(this).apply { setText(cue.startMs.toString()); hint = "بداية المقطع بالميلي ثانية"; inputType = InputType.TYPE_CLASS_NUMBER }
-        val endInput = EditText(this).apply { setText(cue.endMs.toString()); hint = "نهاية المقطع بالميلي ثانية"; inputType = InputType.TYPE_CLASS_NUMBER }
+    private fun showQualitySettings() {
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16)) }
-        listOf(sourceInput, translatedInput, startInput, endInput).forEach { box.addView(it, matchWrap()) }
-        AlertDialog.Builder(this).setTitle("تحرير المقطع ${index + 1}").setView(box)
+        val interval = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
+                listOf("سريع · 600ms", "متوازن · 900ms", "موفر للطاقة · 1400ms"))
+            setSelection(when (scanIntervalMs) { in 0..700 -> 0; in 701..1100 -> 1; else -> 2 })
+        }
+        val style = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
+                listOf("طبيعية وسياقية", "حوار أنمي", "رسمية", "مختصرة"))
+            setSelection(listOf("طبيعية وسياقية", "حوار أنمي", "رسمية", "مختصرة").indexOf(translationStyle).coerceAtLeast(0))
+        }
+        val size = SeekBar(this).apply { max = 14; progress = (subtitleFontSize - 13f).toInt().coerceIn(0, 14) }
+        val backgroundCheck = CheckBox(this).apply { text = "خلفية داكنة للنص"; setTextColor(Color.WHITE); isChecked = subtitleBackground }
+        box.addView(text("جودة الالتقاط واستهلاك البطارية", 14f, gold)); box.addView(interval)
+        box.addView(text("أسلوب الصياغة العربية", 14f, gold)); box.addView(style)
+        box.addView(text("حجم الترجمة", 14f, gold)); box.addView(size); box.addView(backgroundCheck)
+        AlertDialog.Builder(this).setTitle("الجودة") .setView(box)
             .setPositiveButton("حفظ") { _, _ ->
-                val start = startInput.text.toString().toLongOrNull() ?: cue.startMs
-                val end = endInput.text.toString().toLongOrNull() ?: cue.endMs
-                if (end <= start || sourceInput.text.isBlank()) { toast("تحقق من النص والتوقيت"); return@setPositiveButton }
-                pushCueUndo()
-                cue.startMs = start; cue.endMs = end
-                cue.source = sourceInput.text.toString().trim()
-                cue.translated = translatedInput.text.toString().trim()
-                persistCues(); refreshTimelineStatus()
-            }
-            .setNeutralButton("حفظ الترجمة في القاموس") { _, _ ->
-                val translated = translatedInput.text.toString().trim()
-                if (translated.isNotBlank()) {
-                    saveGlossary(cue.source, translated, "تصحيح من الخط الزمني")
-                    pushCueUndo(); cue.translated = translated; persistCues()
-                    toast("تم حفظ التصحيح في القاموس المحلي")
-                }
-            }
-            .setNegativeButton("حذف") { _, _ ->
-                pushCueUndo(); cues.removeAt(index); persistCues(); refreshTimelineStatus()
-            }.show()
-    }
-
-    private fun exportSubtitles(webVtt: Boolean) {
-        if (cues.isEmpty()) { toast("لا توجد ترجمة لتصديرها"); return }
-        val sorted = cues.sortedBy { it.startMs }
-        val content = buildString {
-            if (webVtt) append("WEBVTT\n\n")
-            sorted.forEachIndexed { index, cue ->
-                val start = cue.startMs.coerceAtLeast(0)
-                val end = cue.endMs.coerceAtLeast(start + 1)
-                if (!webVtt) append("${index + 1}\n")
-                append("${subtitleTimestamp(start, webVtt)} --> ${subtitleTimestamp(end, webVtt)}\n")
-                if (cue.translated.isNotBlank()) append(cue.translated) else append(cue.source)
-                append("\n\n")
-            }
-        }
-        pendingDocumentText = content
-        if (webVtt) exportVtt.launch("VIDEO_FOX_subtitles.vtt") else exportSrt.launch("VIDEO_FOX_subtitles.srt")
-    }
-
-    private fun subtitleTimestamp(ms: Long, vtt: Boolean): String {
-        val h = ms / 3600000
-        val m = (ms / 60000) % 60
-        val sec = (ms / 1000) % 60
-        val milli = ms % 1000
-        return String.format(Locale.US, "%02d:%02d:%02d%s%03d", h, m, sec, if (vtt) "." else ",", milli)
-    }
-
-    private fun showQualityReport() {
-        if (cues.isEmpty()) { toast("لا توجد مقاطع لفحصها"); return }
-        val sorted = cues.sortedBy { it.startMs }
-        val issues = mutableListOf<String>()
-        sorted.forEachIndexed { index, cue ->
-            if (cue.source.isBlank()) issues.add("المقطع ${index + 1}: النص الأصلي فارغ")
-            if (cue.translated.isBlank()) issues.add("المقطع ${index + 1}: الترجمة غير موجودة")
-            val foreignLetters = cue.translated.count { it.isLetter() && it.code in 65..122 }
-            if (foreignLetters >= 4) issues.add("المقطع ${index + 1}: توجد أحرف لاتينية متبقية؛ قد تكون اسماً أو نصاً يحتاج مراجعة")
-            if (cue.endMs <= cue.startMs) issues.add("المقطع ${index + 1}: توقيت غير صالح")
-            if (index > 0 && cue.startMs < sorted[index - 1].endMs) issues.add("تداخل زمني بين المقطعين $index و${index + 1}")
-            if (index > 0 && cue.source.equals(sorted[index - 1].source, true)) issues.add("تكرار محتمل للنص في المقطعين $index و${index + 1}")
-        }
-        val report = if (issues.isEmpty()) "اجتاز الخط الزمني الفحص البنيوي.\nعدد المقاطع: ${cues.size}\n\nهذا الفحص لا يثبت دقة الترجمة اللغوية أو OCR." else
-            "المقاطع: ${cues.size}\nالملاحظات: ${issues.size}\n\n" + issues.take(80).joinToString("\n") + "\n\nالفحص بنيوي؛ راجع النصوص بصرياً."
-        AlertDialog.Builder(this).setTitle("VIDEO FOX · Quality Guard").setMessage(report)
-            .setPositiveButton("حسناً", null).show()
-    }
-
-    private fun showKnowledge() {
-        val options = arrayOf("عرض القاموس وإضافة مصطلح", "بطاقات المتحدثين", "معلومات النسخ الاحتياطي")
-        AlertDialog.Builder(this).setTitle("مركز المعرفة المحلي")
-            .setItems(options) { _, which ->
-                when (which) {
-                    0 -> manageGlossary()
-                    1 -> manageCharacters()
-                    2 -> toast("تُضمّن القواميس وبطاقات المتحدثين تلقائياً داخل نسخة ZIP")
-                }
-            }.setNegativeButton("إغلاق", null).show()
-    }
-
-    private fun manageGlossary() {
-        val array = JSONArray(knowledgePrefs.getString("glossary", "[]"))
-        val labels = (0 until array.length()).map { i ->
-            val o = array.optJSONObject(i) ?: JSONObject()
-            "${o.optString("source")}  →  ${o.optString("arabic")}"
-        }.toMutableList()
-        labels.add("＋ إضافة مصطلح جديد")
-        AlertDialog.Builder(this).setTitle("قاموس المصطلحات · ${array.length()}")
-            .setItems(labels.toTypedArray()) { _, which ->
-                if (which == labels.lastIndex) {
-                    val source = EditText(this).apply { hint = "المصطلح الأصلي" }
-                    val target = EditText(this).apply { hint = "المقابل العربي" }
-                    val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16)); addView(source); addView(target) }
-                    AlertDialog.Builder(this).setTitle("إضافة مصطلح").setView(box)
-                        .setPositiveButton("حفظ") { _, _ ->
-                            if (source.text.isNotBlank() && target.text.isNotBlank()) {
-                                saveGlossary(source.text.toString(), target.text.toString(), "")
-                                toast("تم حفظ المصطلح")
-                            }
-                        }.setNegativeButton("إلغاء", null).show()
-                } else {
-                    val o = array.optJSONObject(which) ?: return@setItems
-                    AlertDialog.Builder(this).setTitle(o.optString("source"))
-                        .setMessage(o.optString("arabic") + "\n\n" + o.optString("note"))
-                        .setPositiveButton("حذف") { _, _ -> deleteGlossary(o.optString("source")); toast("تم حذف المصطلح") }
-                        .setNegativeButton("إغلاق", null).show()
-                }
-            }.setNegativeButton("إغلاق", null).show()
-    }
-
-    private fun manageCharacters() {
-        val array = JSONArray(knowledgePrefs.getString("characters", "[]"))
-        val input = EditText(this).apply { hint = "اسم المتحدث | أسلوبه | ملاحظات (افصل بينها بعلامة |)" }
-        AlertDialog.Builder(this).setTitle("بطاقات المتحدثين")
-            .setMessage((0 until array.length()).joinToString("\n") { i ->
-                val o = array.optJSONObject(i) ?: JSONObject()
-                "• ${o.optString("name")} — ${o.optString("voice")}"
-            }.ifBlank { "لا توجد بطاقات محفوظة." })
-            .setView(input)
-            .setPositiveButton("إضافة") { _, _ ->
-                val parts = input.text.toString().split("|", limit = 3).map { it.trim() }
-                if (parts.isNotEmpty() && parts[0].isNotBlank()) {
-                    val updated = JSONArray()
-                    for (i in 0 until array.length()) updated.put(array.getJSONObject(i))
-                    updated.put(JSONObject().put("name", parts[0]).put("voice", parts.getOrElse(1) { "" }).put("notes", parts.getOrElse(2) { "" }))
-                    knowledgePrefs.edit().putString("characters", updated.toString()).apply()
-                    toast("تم حفظ بطاقة المتحدث")
-                }
-            }.setNegativeButton("إغلاق", null).show()
-    }
-
-    private fun saveGlossary(source: String, arabic: String, note: String) {
-        val old = JSONArray(knowledgePrefs.getString("glossary", "[]"))
-        val updated = JSONArray()
-        for (i in 0 until old.length()) {
-            val o = old.optJSONObject(i) ?: continue
-            if (!o.optString("source").equals(source, true)) updated.put(o)
-        }
-        updated.put(JSONObject().put("source", source.trim()).put("arabic", arabic.trim()).put("note", note))
-        knowledgePrefs.edit().putString("glossary", updated.toString()).apply()
-    }
-
-    private fun deleteGlossary(source: String) {
-        val old = JSONArray(knowledgePrefs.getString("glossary", "[]"))
-        val updated = JSONArray()
-        for (i in 0 until old.length()) {
-            val o = old.optJSONObject(i) ?: continue
-            if (!o.optString("source").equals(source, true)) updated.put(o)
-        }
-        knowledgePrefs.edit().putString("glossary", updated.toString()).apply()
-    }
-
-    private fun exactGlossary(source: String): String? {
-        val array = JSONArray(knowledgePrefs.getString("glossary", "[]"))
-        for (i in 0 until array.length()) {
-            val o = array.optJSONObject(i) ?: continue
-            if (o.optString("source").trim().equals(source.trim(), true)) return o.optString("arabic").takeIf { it.isNotBlank() }
-        }
-        return null
-    }
-
-    private fun showSubtitleAppearance() {
-        val options = arrayOf("استيراد خط TTF / OTF", "إظهار / إخفاء النص الأصلي", "تفعيل / إيقاف الملاءمة التلقائية")
-        AlertDialog.Builder(this).setTitle("مظهر الترجمة")
-            .setItems(options) { _, which ->
-                when (which) {
-                    0 -> importFont.launch(arrayOf("font/ttf", "font/otf", "application/octet-stream"))
-                    1 -> {
-                        hideOriginalSubtitle = !hideOriginalSubtitle
-                        originalSubtitle.visibility = if (hideOriginalSubtitle) View.GONE else View.VISIBLE
-                        toast(if (hideOriginalSubtitle) "تم إخفاء النص الأصلي" else "تم إظهار النص الأصلي")
-                    }
-                    2 -> {
-                        autoFitSubtitle = !autoFitSubtitle
-                        getSharedPreferences("video_fox", MODE_PRIVATE).edit().putBoolean("auto_fit", autoFitSubtitle).apply()
-                        applySubtitleStyle()
-                        toast(if (autoFitSubtitle) "الملاءمة التلقائية مفعلة" else "الملاءمة التلقائية متوقفة")
-                    }
-                }
-            }.setNegativeButton("إغلاق", null).show()
+                scanIntervalMs = when (interval.selectedItemPosition) { 0 -> 600L; 2 -> 1400L; else -> 900L }
+                translationStyle = style.selectedItem.toString()
+                subtitleFontSize = 13f + size.progress
+                subtitleBackground = backgroundCheck.isChecked
+                applySubtitleStyle()
+                getSharedPreferences("video_fox", MODE_PRIVATE).edit().putLong("scan_interval", scanIntervalMs)
+                    .putString("translation_style", translationStyle).putFloat("subtitle_size", subtitleFontSize)
+                    .putBoolean("subtitle_bg", subtitleBackground).apply()
+                mainHandler.removeCallbacks(scanRunnable); mainHandler.post(scanRunnable)
+                status("تم حفظ إعدادات الجودة")
+            }.setNegativeButton("إلغاء", null).show()
     }
 
     private fun applySubtitleStyle() {
-        customTypeface?.let {
-            originalSubtitle.typeface = it
-            arabicSubtitle.typeface = it
+        if (!::arabicSubtitle.isInitialized) return
+        arabicSubtitle.textSize = subtitleFontSize
+        originalSubtitle.textSize = (subtitleFontSize - 2f).coerceAtLeast(11f)
+        (arabicSubtitle.parent as? View)?.setBackgroundColor(if (subtitleBackground) 0x99000000.toInt() else Color.TRANSPARENT)
+    }
+
+    private fun showGlossaryEditor() {
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16)) }
+        val source = EditText(this).apply { hint = "المصطلح الأصلي" }
+        val target = EditText(this).apply { hint = "المعنى العربي المفضل" }
+        box.addView(source); box.addView(target)
+        val entries = glossary.entries.joinToString("\n") { "${it.key} ← ${it.value}" }
+        box.addView(text(if (entries.isBlank()) "لا توجد مصطلحات محفوظة" else entries, 12f, muted))
+        AlertDialog.Builder(this).setTitle("المعجم الشخصي").setView(box)
+            .setPositiveButton("إضافة") { _, _ ->
+                val a = source.text.toString().trim(); val b = target.text.toString().trim()
+                if (a.isNotBlank() && b.isNotBlank()) { glossary[a] = b; saveGlossary(); toast("تمت إضافة المصطلح") }
+            }.setNeutralButton("إغلاق", null).show()
+    }
+
+    private fun applyGlossary(value: String): String {
+        var result = value
+        glossary.forEach { (source, target) -> result = result.replace(source, target, ignoreCase = true) }
+        return result
+    }
+
+    private fun saveGlossary() {
+        getSharedPreferences("video_fox", MODE_PRIVATE).edit().putString("glossary", JSONObject(glossary as Map<*, *>).toString()).apply()
+    }
+
+    private fun showSubtitleStudio() {
+        val scroll = ScrollView(this)
+        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(14)) }
+        if (subtitleCues.isEmpty()) list.addView(text("ابدأ تشغيل الفيديو مع تفعيل الترجمة لتظهر المقاطع هنا.", 14f, muted))
+        subtitleCues.forEachIndexed { index, cue ->
+            val card = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(10)); setBackgroundColor(panel) }
+            card.addView(text("${index + 1}. ${formatTime(cue.startMs)}", 11f, gold))
+            card.addView(text(cue.source, 13f, Color.WHITE))
+            card.addView(text(cue.translated.ifBlank { "بانتظار الترجمة" }, 15f, gold))
+            card.addView(button("تعديل الترجمة") { editCue(index) })
+            val lp = LinearLayout.LayoutParams(-1, -2); lp.bottomMargin = dp(8); list.addView(card, lp)
         }
-        if (autoFitSubtitle) {
-            originalSubtitle.maxLines = 2
-            arabicSubtitle.maxLines = 3
-            originalSubtitle.setAutoSizeTextTypeUniformWithConfiguration(11, 16, 1, TypedValue.COMPLEX_UNIT_SP)
-            arabicSubtitle.setAutoSizeTextTypeUniformWithConfiguration(12, 21, 1, TypedValue.COMPLEX_UNIT_SP)
-        } else {
-            originalSubtitle.setAutoSizeTextTypeWithDefaults(TextView.AUTO_SIZE_TEXT_TYPE_NONE)
-            arabicSubtitle.setAutoSizeTextTypeWithDefaults(TextView.AUTO_SIZE_TEXT_TYPE_NONE)
-            originalSubtitle.textSize = 15f
-            arabicSubtitle.textSize = 18f
+        scroll.addView(list)
+        AlertDialog.Builder(this).setTitle("استوديو الترجمة · ${subtitleCues.size} مقطع")
+            .setView(scroll).setPositiveButton("تصدير SRT") { _, _ -> if (subtitleCues.isNotEmpty()) createSrt.launch("${safeFileName(currentVideoName)}.srt") }
+            .setNegativeButton("إغلاق", null).show()
+    }
+
+    private fun editCue(index: Int) {
+        val cue = subtitleCues.getOrNull(index) ?: return
+        val input = EditText(this).apply { setText(cue.translated); minLines = 2; gravity = Gravity.TOP }
+        AlertDialog.Builder(this).setTitle("تحرير الترجمة رقم ${index + 1}").setView(input)
+            .setPositiveButton("حفظ") { _, _ -> cue.translated = input.text.toString().trim(); persistSubtitleCues(); if (index == subtitleCues.lastIndex) arabicSubtitle.text = cue.translated }
+            .setNegativeButton("إلغاء", null).show()
+    }
+
+    private fun showLibrary() {
+        val prefs = getSharedPreferences("video_fox", MODE_PRIVATE)
+        val items = prefs.getString("video_library", "[]") ?: "[]"
+        val arr = runCatching { org.json.JSONArray(items) }.getOrDefault(org.json.JSONArray())
+        if (arr.length() == 0) { AlertDialog.Builder(this).setTitle("مكتبة VIDEO FOX").setMessage("ستظهر هنا الفيديوهات التي فتحتها سابقاً.").setPositiveButton("حسناً", null).show(); return }
+        val labels = (0 until arr.length()).map { arr.optJSONObject(it)?.optString("name", "فيديو") ?: "فيديو" }.toTypedArray()
+        AlertDialog.Builder(this).setTitle("مكتبة الفيديو").setItems(labels) { _, which ->
+            val uri = arr.optJSONObject(which)?.optString("uri").orEmpty()
+            if (uri.isNotBlank()) openVideo(Uri.parse(uri))
+        }.setNegativeButton("إغلاق", null).show()
+    }
+
+    private fun saveVideoToLibrary() {
+        val prefs = getSharedPreferences("video_fox", MODE_PRIVATE)
+        val old = runCatching { org.json.JSONArray(prefs.getString("video_library", "[]")) }.getOrDefault(org.json.JSONArray())
+        val updated = org.json.JSONArray().put(JSONObject().put("name", currentVideoName).put("uri", lastSavedVideoUri))
+        for (i in 0 until old.length()) {
+            val item = old.optJSONObject(i) ?: continue
+            if (item.optString("uri") != lastSavedVideoUri && updated.length() < 30) updated.put(item)
+        }
+        prefs.edit().putString("video_library", updated.toString()).apply()
+    }
+
+    private fun persistSubtitleCues() {
+        if (currentVideoKey.isBlank()) return
+        val array = org.json.JSONArray()
+        subtitleCues.forEach { cue -> array.put(JSONObject().put("start", cue.startMs).put("end", cue.endMs).put("source", cue.source).put("translated", cue.translated)) }
+        getSharedPreferences("video_fox", MODE_PRIVATE).edit().putString("cues_$currentVideoKey", array.toString()).apply()
+    }
+
+    private fun loadSubtitleCues() {
+        if (currentVideoKey.isBlank()) return
+        val raw = getSharedPreferences("video_fox", MODE_PRIVATE).getString("cues_$currentVideoKey", "[]") ?: "[]"
+        val array = runCatching { org.json.JSONArray(raw) }.getOrDefault(org.json.JSONArray())
+        for (i in 0 until array.length()) {
+            val item = array.optJSONObject(i) ?: continue
+            subtitleCues.add(SubtitleCue(item.optLong("start"), item.optLong("end"), item.optString("source"), item.optString("translated")))
         }
     }
 
-    private fun backupProject() {
-        runCatching {
-            val bytes = ByteArrayOutputStream()
-            ZipOutputStream(bytes).use { zip ->
-                fun put(name: String, value: ByteArray) {
-                    zip.putNextEntry(ZipEntry(name)); zip.write(value); zip.closeEntry()
-                }
-                val manifest = JSONObject().put("format", "VIDEO_FOX_PROJECT").put("version", 2)
-                    .put("videoUri", selectedUri?.toString().orEmpty())
-                    .put("positionMs", if (::player.isInitialized) player.currentPosition else 0L)
-                put("project.json", manifest.toString().toByteArray(Charsets.UTF_8))
-                put("timeline.json", cuesJson().toString().toByteArray(Charsets.UTF_8))
-                put("knowledge.json", JSONObject()
-                    .put("glossary", JSONArray(knowledgePrefs.getString("glossary", "[]")))
-                    .put("characters", JSONArray(knowledgePrefs.getString("characters", "[]"))).toString().toByteArray(Charsets.UTF_8))
-            }
-            pendingArchiveBytes = bytes.toByteArray()
-            exportProject.launch("VIDEO_FOX_Project.zip")
-        }.onFailure { toast("فشل تجهيز المشروع: ${it.localizedMessage}") }
-    }
+    private fun queryDisplayName(uri: Uri): String? = runCatching {
+        contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+            if (it.moveToFirst()) it.getString(0) else null
+        }
+    }.getOrNull()
 
-    private fun restoreProject(input: java.io.InputStream) {
-        val temp = File(cacheDir, "videofox_import_${System.currentTimeMillis()}").apply { mkdirs() }
-        var total = 0L
-        val allowed = setOf("project.json", "timeline.json", "knowledge.json")
+    private fun exportSrt(uri: Uri) {
         try {
-            ZipInputStream(input).use { zip ->
-                while (true) {
-                    val entry = zip.nextEntry ?: break
-                    val name = entry.name.replace('\\', '/')
-                    require(!entry.isDirectory && name in allowed) { "عنصر ZIP غير مسموح: $name" }
-                    val target = File(temp, name)
-                    var count = 0L
-                    target.outputStream().use { out ->
-                        val buffer = ByteArray(8192)
-                        while (true) {
-                            val n = zip.read(buffer)
-                            if (n < 0) break
-                            count += n; total += n
-                            require(count <= 5L * 1024 * 1024 && total <= 12L * 1024 * 1024) { "حجم النسخة أكبر من الحد" }
-                            out.write(buffer, 0, n)
-                        }
+            contentResolver.openOutputStream(uri)?.use { output ->
+                OutputStreamWriter(output, Charsets.UTF_8).use { writer ->
+                    subtitleCues.forEachIndexed { index, cue ->
+                        val start = cue.startMs
+                        val end = cue.endMs.coerceAtLeast(start + 500)
+                        writer.write("${index + 1}\n${srtTime(start)} --> ${srtTime(end)}\n${cue.translated.ifBlank { cue.source }}\n\n")
                     }
                 }
             }
-            val project = JSONObject(File(temp, "project.json").readText(Charsets.UTF_8))
-            require(project.optString("format") == "VIDEO_FOX_PROJECT") { "صيغة المشروع غير معروفة" }
-            val timeline = File(temp, "timeline.json")
-            if (timeline.isFile) restoreCueSnapshot(timeline.readText(Charsets.UTF_8))
-            val knowledge = File(temp, "knowledge.json")
-            if (knowledge.isFile) {
-                val obj = JSONObject(knowledge.readText(Charsets.UTF_8))
-                knowledgePrefs.edit().putString("glossary", obj.optJSONArray("glossary")?.toString() ?: "[]")
-                    .putString("characters", obj.optJSONArray("characters")?.toString() ?: "[]").apply()
-            }
-            val video = project.optString("videoUri")
-            if (video.isNotBlank()) toast("تم استيراد بيانات المشروع؛ اختر الفيديو الأصلي لإعادة ربطه")
-        } finally { temp.deleteRecursively() }
+            toast("تم تصدير ملف الترجمة")
+        } catch (e: Exception) { toast("فشل التصدير: ${e.localizedMessage}") }
     }
+
+    private fun srtTime(ms: Long): String {
+        val h = ms / 3600000; val m = (ms / 60000) % 60; val sec = (ms / 1000) % 60; val milli = ms % 1000
+        return String.format(Locale.US, "%02d:%02d:%02d,%03d", h, m, sec, milli)
+    }
+
+    private fun safeFileName(value: String) = value.substringBeforeLast('.').replace(Regex("[^A-Za-z0-9_-]"), "_").take(48).ifBlank { "video_fox" }
 
     private fun showRemoteSettings() {
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(18)) }
@@ -974,6 +683,9 @@ class MainActivity : ComponentActivity() {
             setText(remoteApiKey)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
+        val aiEndpointInput = EditText(this).apply { hint = "OpenAI-compatible endpoint (اختياري)"; setText(aiEndpoint); inputType = InputType.TYPE_TEXT_VARIATION_URI }
+        val aiKeyInput = EditText(this).apply { hint = "مفتاح AI (اختياري للخادم المحلي)"; setText(aiApiKey); inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD }
+        val aiModelInput = EditText(this).apply { hint = "اسم النموذج"; setText(aiModel) }
         val remoteCheck = android.widget.CheckBox(this).apply {
             text = "تفضيل الخدمة الخارجية قبل المحلي"
             setTextColor(Color.WHITE)
@@ -984,21 +696,8 @@ class MainActivity : ComponentActivity() {
         box.addView(text("مفتاح الخدمة", 13f, muted))
         box.addView(keyInput)
         box.addView(remoteCheck)
-        val languageButton = Button(this).apply {
-            text = "لغة OCR: " + when (sourceOcrLanguage) { "ja" -> "اليابانية"; "ko" -> "الكورية"; "zh" -> "الصينية"; else -> "تلقائي / لاتينية" }
-            isAllCaps = false
-            setOnClickListener {
-                val codes = arrayOf("auto", "ja", "ko", "zh")
-                val names = arrayOf("تلقائي / لاتينية", "اليابانية", "الكورية", "الصينية")
-                AlertDialog.Builder(this@MainActivity).setTitle("لغة النص داخل الفيديو")
-                    .setItems(names) { _, index ->
-                        sourceOcrLanguage = codes[index]
-                        getSharedPreferences("video_fox", MODE_PRIVATE).edit().putString("ocr_language", sourceOcrLanguage).apply()
-                        text = "لغة OCR: " + names[index]
-                    }.show()
-            }
-        }
-        box.addView(languageButton)
+        box.addView(text("محرك المعنى والسياق · متوافق مع Chat Completions", 13f, gold))
+        box.addView(aiEndpointInput); box.addView(aiModelInput); box.addView(aiKeyInput)
         AlertDialog.Builder(this)
             .setTitle("إعداد محرك الترجمة")
             .setView(box)
@@ -1006,10 +705,13 @@ class MainActivity : ComponentActivity() {
                 remoteEndpoint = endpointInput.text.toString().trim()
                 remoteApiKey = keyInput.text.toString().trim()
                 preferRemote = remoteCheck.isChecked
+                aiEndpoint = aiEndpointInput.text.toString().trim()
+                aiModel = aiModelInput.text.toString().trim()
+                aiApiKey = aiKeyInput.text.toString().trim()
                 getSharedPreferences("video_fox", MODE_PRIVATE).edit()
-                    .putString("endpoint", remoteEndpoint)
-                    .putString("api_key", remoteApiKey)
-                    .putBoolean("prefer_remote", preferRemote).apply()
+                    .putString("endpoint", remoteEndpoint).putString("api_key", remoteApiKey)
+                    .putBoolean("prefer_remote", preferRemote).putString("ai_endpoint", aiEndpoint)
+                    .putString("ai_model", aiModel).putString("ai_key", aiApiKey).apply()
                 status("تم حفظ إعدادات الترجمة")
             }
             .setNegativeButton("إلغاء", null).show()
@@ -1020,13 +722,15 @@ class MainActivity : ComponentActivity() {
         remoteEndpoint = prefs.getString("endpoint", "") ?: ""
         remoteApiKey = prefs.getString("api_key", "") ?: ""
         preferRemote = prefs.getBoolean("prefer_remote", false)
-        sourceOcrLanguage = prefs.getString("ocr_language", "auto") ?: "auto"
-        loadRegions()
-        autoFitSubtitle = prefs.getBoolean("auto_fit", true)
-        if (prefs.getBoolean("custom_font", false)) {
-            val fontFile = File(filesDir, "video_fox_custom_font.ttf")
-            if (fontFile.isFile) runCatching { customTypeface = Typeface.createFromFile(fontFile) }
-        }
+        aiEndpoint = prefs.getString("ai_endpoint", "") ?: ""
+        aiModel = prefs.getString("ai_model", "") ?: ""
+        aiApiKey = prefs.getString("ai_key", "") ?: ""
+        scanIntervalMs = prefs.getLong("scan_interval", 900L)
+        translationStyle = prefs.getString("translation_style", "طبيعية وسياقية") ?: "طبيعية وسياقية"
+        subtitleFontSize = prefs.getFloat("subtitle_size", 17f)
+        subtitleBackground = prefs.getBoolean("subtitle_bg", true)
+        val savedGlossary = runCatching { JSONObject(prefs.getString("glossary", "{}")) }.getOrNull()
+        savedGlossary?.keys()?.forEach { key -> glossary[key] = savedGlossary.optString(key) }
     }
 
     private fun resetSubtitleState() {
@@ -1135,23 +839,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         super.onPause()
-        if (::player.isInitialized) {
-            player.pause()
-            getSharedPreferences("video_fox", MODE_PRIVATE).edit()
-                .putLong("last_position_ms", player.currentPosition)
-                .putString("last_video_uri", selectedUri?.toString().orEmpty()).apply()
-        }
-        persistCues()
+        if (::player.isInitialized) player.pause()
     }
 
     override fun onDestroy() {
         mainHandler.removeCallbacks(scanRunnable)
         scanEnabled = false
         try { retriever?.release() } catch (_: Exception) { }
-        try { latinRecognizer.close() } catch (_: Exception) { }
-        try { japaneseRecognizer.close() } catch (_: Exception) { }
-        try { koreanRecognizer.close() } catch (_: Exception) { }
-        try { chineseRecognizer.close() } catch (_: Exception) { }
+        try { recognizers.forEach { it.close() } } catch (_: Exception) { }
         try { languageIdentifier.close() } catch (_: Exception) { }
         try { translator?.close() } catch (_: Exception) { }
         if (::player.isInitialized) player.release()
