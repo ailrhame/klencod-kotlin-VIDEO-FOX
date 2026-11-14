@@ -1,19 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:allowBackup="false"
         android:label="VIDEO FOX"
         android:theme="@android:style/Theme.Material.NoActionBar"
         android:usesCleartextTraffic="false">
+
         <service
-            android:name="com.video.fox.VideoFoxLensService"
+            android:name=".VideoFoxLensService"
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
+
         <activity
-            android:name="com.video.fox.MainActivity"
+            android:name=".MainActivity"
             android:launchMode="singleTop"
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:exported="true">
