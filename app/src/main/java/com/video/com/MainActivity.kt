@@ -1013,7 +1013,10 @@ class VideoFoxLensService : Service() {
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding((14 * density).toInt(), (12 * density).toInt(), (14 * density).toInt(), (12 * density).toInt())
-            background = GradientDrawable().apply { setColor(0xF214111D.toInt()); cornerRadius = 22 * density; setStroke(1.4f * density, 0xFFFFC43D.toInt()) }
+            background = GradientDrawable().apply { setColor(0xF214111D.toInt()); cornerRadius = 22 * density; setStroke(
+    2,
+    android.graphics.Color.parseColor("#FFB800")
+)}
             elevation = 18 * density
             visibility = View.GONE
         }
