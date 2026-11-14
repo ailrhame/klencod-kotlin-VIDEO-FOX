@@ -1,7 +1,6 @@
 package com.video.fox
 
 import android.app.AlertDialog
-import android.app.ProgressDialog
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -23,10 +22,8 @@ import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
-import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
-import android.widget.SeekBar
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
@@ -65,8 +62,6 @@ class MainActivity : ComponentActivity() {
     private val panel = Color.rgb(22, 19, 33)
     private val panel2 = Color.rgb(30, 26, 44)
     private val muted = Color.rgb(155, 152, 170)
-    private val success = Color.rgb(83, 214, 138)
-    private val danger = Color.rgb(255, 104, 104)
 
     private lateinit var root: LinearLayout
     private lateinit var playerContainer: FrameLayout
@@ -80,8 +75,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var player: ExoPlayer
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val frameExecutor = Executors.newSingleThreadExecutor()
-    private val translateExecutor = Executors.newSingleThreadExecutor()
+    private val frameExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val translateExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val frameBusy = AtomicBoolean(false)
     private val translationEngine = TranslationEngine()
     private val recognizers: List<TextRecognizer> by lazy { listOf(
@@ -181,8 +176,6 @@ class MainActivity : ComponentActivity() {
         if (intent.getBooleanExtra(EXTRA_OPEN_STUDIO, false)) showStudio()
     }
 
-    // ==================== HOME UI ====================
-
     private fun buildHomeUi() {
         studioVisible = false
         root = LinearLayout(this).apply {
@@ -190,7 +183,6 @@ class MainActivity : ComponentActivity() {
             setBackgroundColor(bg); setPadding(dp(14))
         }
         root.addView(buildHeader())
-
         root.addView(text("VIDEO FOX — التقط الحوار، ترجمه سياقياً، في مساحة مستقلة", 12f, muted))
         root.addView(button("اختيار فيديو", gold, Color.BLACK) { pickVideo.launch(arrayOf("video/*")) }, matchWrap().apply { topMargin = dp(8) })
 
@@ -294,7 +286,7 @@ class MainActivity : ComponentActivity() {
         player.setMediaItem(MediaItem.fromUri(uri)); player.prepare(); player.playWhenReady = true
         regionChosen = false; region = RectF(0.08f, 0.72f, 0.92f, 0.96f)
         resetState(); rawCues.clear(); loadCues()
-        status("فُتح الفيديو — ابدأ التشغيل، سيُلتقط النص ثم تترجم بعد الانتهاء")
+        status("فُتح الفيديو — سيُلتقط النص ثم تترجم بعد الانتهاء")
         frameExecutor.execute {
             try {
                 retriever?.release()
@@ -319,9 +311,7 @@ class MainActivity : ComponentActivity() {
         mainHandler.post { status("انتهى الفيديو — ${rawCues.size} مقطع جاهز") }
         if (rawCues.isEmpty()) return
         if (rawCues.all { it.translated.isNotBlank() }) { status("الترجمة مكتملة — افتح المركز"); return }
-        if (autoTranslateOnEnd) triggerTranslation() else {
-            mainHandler.post { showTranslatePrompt() }
-        }
+        if (autoTranslateOnEnd) triggerTranslation() else mainHandler.post { showTranslatePrompt() }
     }
 
     private fun showTranslatePrompt() {
@@ -350,17 +340,15 @@ class MainActivity : ComponentActivity() {
             try {
                 translationEngine.translateBatch(workingList, config) { done, total ->
                     mainHandler.post {
-                        progressBar.progress = (done * 100) / total
+                        progressBar.progress = (done * 100) / total.coerceAtLeast(1)
                         progressLabel.text = "$done / $total مقطع"
                     }
                 }
-                // copy back
-                var idx = 0
-                for (cue in rawCues) if (cue.translated.isBlank() && idx < workingList.size) {
-                    val src = workingList[idx]
-                    if (src.source == cue.source) {
-                        cue.translated = src.translated; cue.speaker = src.speaker; cue.emotion = src.emotion
-                        idx++
+                workingList.forEach { src ->
+                    rawCues.firstOrNull { it.startMs == src.startMs && it.source == src.source }?.let { target ->
+                        target.translated = src.translated
+                        target.speaker = src.speaker
+                        target.emotion = src.emotion
                     }
                 }
                 persistCues()
@@ -376,6 +364,12 @@ class MainActivity : ComponentActivity() {
                     progressBar.visibility = View.GONE; progressLabel.visibility = View.GONE
                     translateButton.isEnabled = true; isTranslating = false
                 }
+            } catch (e: Exception) {
+                mainHandler.post {
+                    status("خطأ غير متوقع: ${e.localizedMessage ?: "?"}")
+                    progressBar.visibility = View.GONE; progressLabel.visibility = View.GONE
+                    translateButton.isEnabled = true; isTranslating = false
+                }
             }
         }
     }
@@ -385,8 +379,8 @@ class MainActivity : ComponentActivity() {
         frameExecutor.execute {
             var handedOff = false; var frameBitmap: Bitmap? = null; var cropBitmap: Bitmap? = null
             try {
-                val sourceRetriever = retriever ?: return@execute
-                frameBitmap = sourceRetriever.getFrameAtTime(positionMs * 1000L, android.media.MediaMetadataRetriever.OPTION_CLOSEST) ?: return@execute
+                val sourceRetriever = retriever ?: run { frameBusy.set(false); return@execute }
+                frameBitmap = sourceRetriever.getFrameAtTime(positionMs * 1000L, android.media.MediaMetadataRetriever.OPTION_CLOSEST) ?: run { frameBusy.set(false); return@execute }
                 val source = frameBitmap!!
                 val rect = RectF(region)
                 val left = (rect.left * source.width).toInt().coerceIn(0, source.width - 1)
@@ -430,8 +424,6 @@ class MainActivity : ComponentActivity() {
         mainHandler.post { status("التقطت ${rawCues.size} مقطعاً — الترجمة لاحقاً") }
     }
 
-    // ==================== STUDIO ====================
-
     private fun showStudio() {
         studioVisible = true
         if (::player.isInitialized) player.pause()
@@ -444,8 +436,7 @@ class MainActivity : ComponentActivity() {
         header.addView(iconButton("⚙") { showRemoteSettings() })
         page.addView(header)
 
-        val translateAllBtn = button("توليد الترجمة السياقية للكل", gold, Color.BLACK) { triggerTranslation() }
-        page.addView(translateAllBtn, matchWrap().apply { topMargin = dp(6) })
+        page.addView(button("توليد الترجمة السياقية للكل", gold, Color.BLACK) { triggerTranslation() }, matchWrap().apply { topMargin = dp(6) })
 
         val search = EditText(this).apply {
             hint = "بحث في النص…"; setTextColor(Color.WHITE); setHintTextColor(muted)
@@ -514,7 +505,7 @@ class MainActivity : ComponentActivity() {
                 background = GradientDrawable().apply { setColor(0xFF221B29.toInt()); cornerRadius = dp(14).toFloat(); setStroke(dp(1), gold) }
             }
             warn.addView(text("محرك الترجمة غير مضبوط", 13f, gold))
-            warn.addView(button("ضبط الآن") { showRemoteSettings() })
+            warn.addView(button("ضبط الآن", gold, Color.BLACK) { showRemoteSettings() }, matchWrap().apply { topMargin = dp(6) })
             page.addView(warn, matchWrap().apply { topMargin = dp(8) })
         }
 
@@ -531,8 +522,8 @@ class MainActivity : ComponentActivity() {
         c.addView(text(cue.source, 13f, Color.WHITE))
         c.addView(text(cue.translated.ifBlank { "بانتظار الترجمة السياقية" }, 15f, if (cue.translated.isBlank()) muted else gold))
         val btns = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        btns.addView(button("انتقال", panel2, goldSoft) { jumpTo() }, weightParams(1f))
-        btns.addView(button("تحرير", panel2, goldSoft) { editCue(cue, onRefresh) }, weightParams(1f))
+        btns.addView(button("انتقال", panel2, goldSoft) { jumpTo() }, weightParams(1f).apply { marginEnd = dp(4) })
+        btns.addView(button("تحرير", panel2, goldSoft) { editCue(cue, onRefresh) }, weightParams(1f).apply { marginStart = dp(4) })
         c.addView(btns, matchWrap().apply { topMargin = dp(6) })
         return c.apply { layoutParams = cardParams() }
     }
@@ -561,8 +552,6 @@ class MainActivity : ComponentActivity() {
     private fun cardParams() = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) }
 
     private fun returnToHome() { studioVisible = false; buildHomeUi(); playerView.player = player }
-
-    // ==================== DASHBOARD ====================
 
     private fun showFoxDashboard() {
         val items = arrayOf("إعدادات محرك الترجمة", "الجودة وسرعة الالتقاط", "المعجم الشخصي", "الشخصيات", "مكتبة الفيديو")
@@ -630,9 +619,15 @@ class MainActivity : ComponentActivity() {
 
     private fun showRemoteSettings() {
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(18)) }
-        val ep = EditText(this).apply { hint = "https://.../v1/chat/completions"; setText(aiEndpoint); inputType = InputType.TYPE_TEXT_VARIATION_URI }
+        val ep = EditText(this).apply {
+            hint = "https://.../v1/chat/completions"; setText(aiEndpoint)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+        }
         val mdl = EditText(this).apply { hint = "model id"; setText(aiModel) }
-        val key = EditText(this).apply { hint = "API key"; setText(aiApiKey); inputType = InputType.TYPE_TEXT_VARIATION_PASSWORD }
+        val key = EditText(this).apply {
+            hint = "API key"; setText(aiApiKey)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
         box.addView(text("Chat Completions endpoint", 12f, gold)); box.addView(ep)
         box.addView(text("model", 12f, gold)); box.addView(mdl)
         box.addView(text("API key", 12f, gold)); box.addView(key)
@@ -668,8 +663,6 @@ class MainActivity : ComponentActivity() {
         prefs.edit().putString("video_library", upd.toString()).apply()
     }
 
-    // ==================== PERSIST ====================
-
     private fun persistCues() {
         if (currentVideoKey.isBlank()) return
         val arr = JSONArray(); rawCues.forEach { arr.put(it.toJson()) }
@@ -687,8 +680,6 @@ class MainActivity : ComponentActivity() {
         val raw = getSharedPreferences("video_fox_lens", MODE_PRIVATE).getString("entries", "[]") ?: "[]"
         return runCatching { JSONArray(raw) }.getOrDefault(JSONArray())
     }
-
-    // ==================== EXPORT ====================
 
     private fun exportSrt(uri: Uri) {
         try {
@@ -708,8 +699,9 @@ class MainActivity : ComponentActivity() {
     private fun exportJson(uri: Uri) {
         try {
             contentResolver.openOutputStream(uri)?.use { out ->
-                val root = JSONObject().put("video", currentVideoName).put("cues", JSONArray().also { a -> rawCues.forEach { a.put(it.toJson()) } })
-                OutputStreamWriter(out, Charsets.UTF_8).use { it.write(root.toString(2)) }
+                val rootObj = JSONObject().put("video", currentVideoName)
+                    .put("cues", JSONArray().also { a -> rawCues.forEach { a.put(it.toJson()) } })
+                OutputStreamWriter(out, Charsets.UTF_8).use { it.write(rootObj.toString(2)) }
             }
             toast("تم التصدير")
         } catch (e: Exception) { toast("فشل: ${e.localizedMessage}") }
@@ -721,8 +713,6 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun safeFileName(v: String) = v.substringBeforeLast('.').replace(Regex("[^A-Za-z0-9_-]"), "_").take(48).ifBlank { "video_fox" }
-
-    // ==================== LIFECYCLE ====================
 
     private fun loadSettings() {
         val p = getSharedPreferences("video_fox", MODE_PRIVATE)
@@ -798,8 +788,6 @@ class MainActivity : ComponentActivity() {
 
     @Suppress("DEPRECATION")
     override fun onBackPressed() { if (studioVisible) returnToHome() else super.onBackPressed() }
-
-    // ==================== HELPERS ====================
 
     private fun button(label: String, bgColor: Int, fgColor: Int, action: () -> Unit) = Button(this).apply {
         text = label; isAllCaps = false; textSize = 13f; setTextColor(fgColor)

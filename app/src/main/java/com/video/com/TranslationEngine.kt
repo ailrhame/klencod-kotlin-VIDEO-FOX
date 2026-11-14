@@ -1,4 +1,4 @@
-package com.video.com
+package com.video.fox
 
 import org.json.JSONArray
 import org.json.JSONObject
