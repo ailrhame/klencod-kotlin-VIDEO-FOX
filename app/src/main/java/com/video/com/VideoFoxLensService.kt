@@ -153,7 +153,7 @@ class VideoFoxLensService : Service() {
         val p = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding((14 * d).toInt(), (12 * d).toInt(), (14 * d).toInt(), (12 * d).toInt())
-            background = GradientDrawable().apply { setColor(0xF214111D.toInt()); cornerRadius = 22 * d; setStroke(1.4f * d, 0xFFFFC43D.toInt()) }
+            background = GradientDrawable().apply { setColor(0xF214111D.toInt()); cornerRadius = 22 * d; setStroke((1.4f * d).toInt(), 0xFFFFC43D.toInt()) }
             elevation = 18 * d; visibility = View.GONE
         }
         p.addView(TextView(this).apply { text = "VIDEO FOX  ·  lens"; textSize = 14f; setTextColor(0xFFFFC43D.toInt()); typeface = android.graphics.Typeface.DEFAULT_BOLD })
@@ -174,7 +174,7 @@ class VideoFoxLensService : Service() {
     private fun action(label: String, d: Float, click: () -> Unit) = TextView(this).apply {
         text = label; textSize = 13f; gravity = Gravity.CENTER; setTextColor(Color.WHITE)
         setPadding((10*d).toInt(), (11*d).toInt(), (10*d).toInt(), (11*d).toInt())
-        background = GradientDrawable().apply { setColor(0xFF25202F.toInt()); cornerRadius = 13*d; setStroke(1f*d, 0x664A405A) }
+        background = GradientDrawable().apply { setColor(0xFF25202F.toInt()); cornerRadius = 13*d; setStroke((1f * d).toInt(), 0x664A405A) }
         setOnClickListener { click() }
         layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = (5*d).toInt() }
     }
