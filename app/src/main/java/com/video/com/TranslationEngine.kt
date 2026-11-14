@@ -49,10 +49,9 @@ data class TranslationConfig(
     val mode: String = "auto"
 )
 
-class TranslationEngine(context: Context) {
+class TranslationEngine(@Suppress("UNUSED_PARAMETER") context: Context) {
     class TranslationException(message: String) : Exception(message)
 
-    private val appContext: Context = context.applicationContext
     private val translatorCache = ConcurrentHashMap<String, Translator>()
     private val languageIdentifierDelegate = lazy { LanguageIdentification.getClient() }
     private val languageIdentifier by languageIdentifierDelegate
