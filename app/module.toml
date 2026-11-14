@@ -13,7 +13,7 @@ java = ["src/main/java"]
 res = ["src/main/res"]
 
 [android]
-namespace = "com.video.com"
+namespace = "com.video.fox"
 compileSdk = 34
 minSdk = 24
 targetSdk = 34
