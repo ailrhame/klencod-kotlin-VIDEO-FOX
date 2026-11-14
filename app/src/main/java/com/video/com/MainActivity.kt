@@ -78,7 +78,7 @@ class MainActivity : ComponentActivity() {
     private val frameExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val translateExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val frameBusy = AtomicBoolean(false)
-    private val translationEngine = TranslationEngine()
+    private val translationEngine = TranslationEngine(this)
     private val recognizers: List<TextRecognizer> by lazy { listOf(
         TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS),
         TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build()),
@@ -108,6 +108,7 @@ class MainActivity : ComponentActivity() {
     private var characters = mutableListOf<String>()
     private var scanIntervalMs = 900L
     private var translationStyle = "طبيعية وسياقية"
+    private var translationMode = "auto"
 
     private val createSrt = registerForActivityResult(ActivityResultContracts.CreateDocument("application/x-subrip")) { uri ->
         if (uri != null) exportSrt(uri)
@@ -250,7 +251,7 @@ class MainActivity : ComponentActivity() {
             textSize = 22f; setTextColor(gold); typeface = android.graphics.Typeface.DEFAULT_BOLD
         }, LinearLayout.LayoutParams(0, dp(48), 1f))
         header.addView(TextView(this).apply {
-            text = "V2"
+            text = "V3"
             textSize = 11f; setTextColor(goldSoft); gravity = Gravity.CENTER
             background = GradientDrawable().apply { setColor(panel2); cornerRadius = dp(8).toFloat(); setStroke(dp(1), gold) }
             setPadding(dp(8), dp(4), dp(8), dp(4))
@@ -327,14 +328,21 @@ class MainActivity : ComponentActivity() {
         if (isTranslating) { toast("الترجمة قيد التنفيذ"); return }
         val toTranslate = rawCues.filter { it.translated.isBlank() }
         if (toTranslate.isEmpty()) { toast("لا توجد مقاطع بانتظار الترجمة"); return }
-        if (aiEndpoint.isBlank() || aiModel.isBlank()) { showRemoteSettings(); return }
 
         isTranslating = true
         translateButton.isEnabled = false
         progressBar.visibility = View.VISIBLE; progressLabel.visibility = View.VISIBLE
         progressBar.progress = 0; progressLabel.text = "0 / ${toTranslate.size}"
 
-        val config = TranslationConfig(aiEndpoint, aiModel, aiApiKey, translationStyle, glossary, characters)
+        val config = TranslationConfig(
+            endpoint = aiEndpoint,
+            model = aiModel,
+            apiKey = aiApiKey,
+            style = translationStyle,
+            glossary = glossary,
+            characters = characters,
+            mode = translationMode
+        )
         val workingList = toTranslate.toMutableList()
         translateExecutor.execute {
             try {
@@ -499,14 +507,21 @@ class MainActivity : ComponentActivity() {
         })
         rebuild()
 
-        if (aiEndpoint.isBlank() || aiModel.isBlank()) {
+        if (translationMode == "openai" && (aiEndpoint.isBlank() || aiModel.isBlank())) {
             val warn = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL; setPadding(dp(12))
                 background = GradientDrawable().apply { setColor(0xFF221B29.toInt()); cornerRadius = dp(14).toFloat(); setStroke(dp(1), gold) }
             }
-            warn.addView(text("محرك الترجمة غير مضبوط", 13f, gold))
+            warn.addView(text("وضع API مفعّل لكن الإعدادات فارغة", 13f, gold))
             warn.addView(button("ضبط الآن", gold, Color.BLACK) { showRemoteSettings() }, matchWrap().apply { topMargin = dp(6) })
             page.addView(warn, matchWrap().apply { topMargin = dp(8) })
+        } else if (translationMode == "auto" && aiEndpoint.isBlank()) {
+            val info = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL; setPadding(dp(12))
+                background = GradientDrawable().apply { setColor(0xFF1A2A1A.toInt()); cornerRadius = dp(14).toFloat(); setStroke(dp(1), Color.rgb(83, 214, 138)) }
+            }
+            info.addView(text("وضع تلقائي: الترجمة المحلية ML Kit جاهزة (بدون إنترنت بعد تنزيل النموذج)", 12f, Color.rgb(83, 214, 138)))
+            page.addView(info, matchWrap().apply { topMargin = dp(8) })
         }
 
         setContentView(page)
@@ -520,7 +535,7 @@ class MainActivity : ComponentActivity() {
         c.addView(head)
         if (cue.speaker.isNotBlank()) c.addView(text("🎭 ${cue.speaker}", 11f, goldSoft))
         c.addView(text(cue.source, 13f, Color.WHITE))
-        c.addView(text(cue.translated.ifBlank { "بانتظار الترجمة السياقية" }, 15f, if (cue.translated.isBlank()) muted else gold))
+        c.addView(text(cue.translated.ifBlank { "بانتظار الترجمة" }, 15f, if (cue.translated.isBlank()) muted else gold))
         val btns = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         btns.addView(button("انتقال", panel2, goldSoft) { jumpTo() }, weightParams(1f).apply { marginEnd = dp(4) })
         btns.addView(button("تحرير", panel2, goldSoft) { editCue(cue, onRefresh) }, weightParams(1f).apply { marginStart = dp(4) })
@@ -572,21 +587,29 @@ class MainActivity : ComponentActivity() {
                 listOf("طبيعية وسياقية", "حوار أنمي", "رسمية", "مختصرة"))
             setSelection(listOf("طبيعية وسياقية", "حوار أنمي", "رسمية", "مختصرة").indexOf(translationStyle).coerceAtLeast(0))
         }
+        val modeSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
+                listOf("تلقائي · ML Kit أو API", "محلي فقط · ML Kit", "API فقط · OpenAI"))
+            setSelection(when (translationMode) { "offline" -> 1; "openai" -> 2; else -> 0 })
+        }
         val auto = android.widget.CheckBox(this).apply { text = "توليد الترجمة تلقائياً عند انتهاء الفيديو"; isChecked = autoTranslateOnEnd; setTextColor(Color.WHITE) }
         box.addView(text("فاصل الالتقاط", 13f, gold)); box.addView(interval)
         box.addView(text("أسلوب الصياغة", 13f, gold)); box.addView(style)
+        box.addView(text("محرك الترجمة", 13f, gold)); box.addView(modeSpinner)
         box.addView(auto)
         AlertDialog.Builder(this).setTitle("الجودة").setView(box)
             .setPositiveButton("حفظ") { _, _ ->
                 scanIntervalMs = when (interval.selectedItemPosition) { 0 -> 600L; 2 -> 1400L; else -> 900L }
                 translationStyle = style.selectedItem.toString()
+                translationMode = when (modeSpinner.selectedItemPosition) { 1 -> "offline"; 2 -> "openai"; else -> "auto" }
                 autoTranslateOnEnd = auto.isChecked
                 getSharedPreferences("video_fox", MODE_PRIVATE).edit()
                     .putLong("scan_interval", scanIntervalMs)
                     .putString("translation_style", translationStyle)
+                    .putString("translation_mode", translationMode)
                     .putBoolean("auto_translate", autoTranslateOnEnd).apply()
                 mainHandler.removeCallbacks(scanRunnable); mainHandler.post(scanRunnable)
-                status("حُفظت الإعدادات")
+                status("حُفظت الإعدادات · وضع الترجمة: $translationMode")
             }.setNegativeButton("إلغاء", null).show()
     }
 
@@ -638,7 +661,7 @@ class MainActivity : ComponentActivity() {
                 aiApiKey = key.text.toString().trim()
                 getSharedPreferences("video_fox", MODE_PRIVATE).edit()
                     .putString("ai_endpoint", aiEndpoint).putString("ai_model", aiModel).putString("ai_key", aiApiKey).apply()
-                status(if (aiEndpoint.isNotBlank() && aiModel.isNotBlank()) "حُفظ المحرك" else "العنوان والنموذج مطلوبان")
+                status("حُفظ إعداد API")
             }.setNegativeButton("إلغاء", null).show()
     }
 
@@ -721,6 +744,7 @@ class MainActivity : ComponentActivity() {
         aiApiKey = p.getString("ai_key", "").orEmpty()
         scanIntervalMs = p.getLong("scan_interval", 900L)
         translationStyle = p.getString("translation_style", "طبيعية وسياقية") ?: "طبيعية وسياقية"
+        translationMode = p.getString("translation_mode", "auto") ?: "auto"
         autoTranslateOnEnd = p.getBoolean("auto_translate", true)
         characters = p.getString("characters", "").orEmpty().split(",").map { it.trim() }.filter { it.isNotBlank() }.toMutableList()
         val g = runCatching { JSONObject(p.getString("glossary", "{}")) }.getOrNull()
@@ -808,6 +832,7 @@ class MainActivity : ComponentActivity() {
         mainHandler.removeCallbacks(scanRunnable); scanEnabled = false
         runCatching { retriever?.release() }
         runCatching { recognizers.forEach { it.close() } }
+        runCatching { translationEngine.close() }
         if (::player.isInitialized) player.release()
         frameExecutor.shutdownNow(); translateExecutor.shutdownNow()
         super.onDestroy()

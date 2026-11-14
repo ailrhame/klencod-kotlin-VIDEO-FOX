@@ -74,7 +74,7 @@ class VideoFoxLensService : Service() {
     private var lastText = ""
     private var stableHits = 0
     private var sessionId = ""
-    private val engine = TranslationEngine()
+    private val engine = TranslationEngine(this)
     private val recognizers by lazy { listOf(
         TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS),
         TextRecognition.getClient(JapaneseTextRecognizerOptions.Builder().build()),
@@ -215,11 +215,11 @@ class VideoFoxLensService : Service() {
         if (pending.isEmpty()) { panelStatus?.text = "لا مقاطع بانتظار الترجمة"; return }
 
         val p = getSharedPreferences("video_fox", MODE_PRIVATE)
-        val ep = p.getString("ai_endpoint", "").orEmpty(); val mdl = p.getString("ai_model", "").orEmpty()
-        if (ep.isBlank() || mdl.isBlank()) { panelStatus?.text = "محرك الترجمة غير مضبوط — افتح المركز"; return }
-
+        val ep = p.getString("ai_endpoint", "").orEmpty()
+        val mdl = p.getString("ai_model", "").orEmpty()
         val style = p.getString("translation_style", "طبيعية وسياقية") ?: "طبيعية وسياقية"
         val key = p.getString("ai_key", "").orEmpty()
+        val mode = p.getString("translation_mode", "auto") ?: "auto"
         val gl = runCatching { JSONObject(p.getString("glossary", "{}")) }.getOrDefault(JSONObject())
         val glMap = mutableMapOf<String, String>(); gl.keys().forEach { glMap[it] = gl.optString(it) }
         val chars = p.getString("characters", "").orEmpty().split(",").map { it.trim() }.filter { it.isNotBlank() }
@@ -230,7 +230,7 @@ class VideoFoxLensService : Service() {
         translateWorker.execute {
             try {
                 val working = pending.map { it.second }.toMutableList()
-                engine.translateBatch(working, TranslationConfig(ep, mdl, key, style, glMap, chars)) { done, total ->
+                engine.translateBatch(working, TranslationConfig(ep, mdl, key, style, glMap, chars, mode)) { done, total ->
                     main.post { panelStatus?.text = "ترجمة $done / $total" }
                 }
                 for (k in pending.indices) {
@@ -352,6 +352,7 @@ class VideoFoxLensService : Service() {
         runCatching { reader?.setOnImageAvailableListener(null, null) }
         runCatching { display?.release() }; runCatching { reader?.close() }; runCatching { projection?.stop() }
         runCatching { recognizers.forEach { it.close() } }
+        runCatching { engine.close() }
         runCatching { lens?.let { wm.removeView(it) } }
         runCatching { panel?.let { wm.removeView(it) } }
         worker.shutdownNow(); translateWorker.shutdownNow()

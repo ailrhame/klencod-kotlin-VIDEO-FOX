@@ -1,5 +1,13 @@
 package com.video.fox
 
+import android.content.Context
+import com.google.android.gms.tasks.Tasks
+import com.google.mlkit.common.model.DownloadConditions
+import com.google.mlkit.nl.languageid.LanguageIdentification
+import com.google.mlkit.nl.translate.TranslateLanguage
+import com.google.mlkit.nl.translate.Translation
+import com.google.mlkit.nl.translate.Translator
+import com.google.mlkit.nl.translate.TranslatorOptions
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -8,6 +16,7 @@ import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 data class RawCue(
     val startMs: Long,
@@ -31,17 +40,28 @@ data class RawCue(
 }
 
 data class TranslationConfig(
-    val endpoint: String,
-    val model: String,
-    val apiKey: String,
+    val endpoint: String = "",
+    val model: String = "",
+    val apiKey: String = "",
     val style: String = "طبيعية وسياقية",
     val glossary: Map<String, String> = emptyMap(),
-    val characters: List<String> = emptyList()
+    val characters: List<String> = emptyList(),
+    val mode: String = "auto"
 )
 
-class TranslationEngine {
-
+class TranslationEngine(context: Context) {
     class TranslationException(message: String) : Exception(message)
+
+    private val appContext: Context = context.applicationContext
+    private val translatorCache = ConcurrentHashMap<String, Translator>()
+    private val languageIdentifierDelegate = lazy { LanguageIdentification.getClient() }
+    private val languageIdentifier by languageIdentifierDelegate
+
+    fun close() {
+        runCatching { if (languageIdentifierDelegate.isInitialized()) languageIdentifier.close() }
+        translatorCache.values.forEach { runCatching { it.close() } }
+        translatorCache.clear()
+    }
 
     fun translateBatch(
         cues: MutableList<RawCue>,
@@ -49,6 +69,140 @@ class TranslationEngine {
         onProgress: (done: Int, total: Int) -> Unit
     ) {
         if (cues.isEmpty()) return
+        val effectiveMode = when (config.mode.lowercase(Locale.ROOT)) {
+            "offline" -> "offline"
+            "openai" -> "openai"
+            else -> if (config.endpoint.isNotBlank() && config.model.isNotBlank()) "openai" else "offline"
+        }
+        when (effectiveMode) {
+            "openai" -> translateViaOpenAI(cues, config, onProgress)
+            else -> translateViaMLKit(cues, config, onProgress)
+        }
+    }
+
+    private fun translateViaMLKit(
+        cues: MutableList<RawCue>,
+        config: TranslationConfig,
+        onProgress: (Int, Int) -> Unit
+    ) {
+        val total = cues.size
+        var done = 0
+        cues.forEach { cue ->
+            if (cue.translated.isBlank()) {
+                try {
+                    val translated = translateSingleWithMlKit(cue.source)
+                    cue.translated = applyGlossary(translated, config.glossary)
+                    cue.emotion = inferEmotion(cue.source)
+                } catch (e: Exception) {
+                    cue.translated = ""
+                    cue.emotion = ""
+                }
+            }
+            done++
+            onProgress(done, total)
+        }
+    }
+
+    private fun translateSingleWithMlKit(sourceText: String): String {
+        val clean = sourceText.trim()
+        if (clean.isBlank()) return ""
+        if (clean.any { it in '\u0600'..'\u06FF' } && clean.none { it in 'A'..'Z' || it in 'a'..'z' }) {
+            return clean
+        }
+
+        val detected = runCatching {
+            Tasks.await(languageIdentifier.identifyLanguage(clean.take(400)))
+        }.getOrDefault("und").lowercase(Locale.ROOT).substringBefore('-')
+
+        val sourceLang = when (detected) {
+            "ja" -> TranslateLanguage.JAPANESE
+            "ko" -> TranslateLanguage.KOREAN
+            "zh" -> TranslateLanguage.CHINESE
+            "ar" -> return clean
+            "en" -> TranslateLanguage.ENGLISH
+            else -> TranslateLanguage.ENGLISH
+        }
+
+        val translator = translatorCache.getOrPut(sourceLang) {
+            Translation.getClient(
+                TranslatorOptions.Builder()
+                    .setSourceLanguage(sourceLang)
+                    .setTargetLanguage(TranslateLanguage.ARABIC)
+                    .build()
+            )
+        }
+
+        val condition = DownloadConditions.Builder().build()
+        Tasks.await(translator.downloadModelIfNeeded(condition))
+
+        val chunks = chunkText(clean, 240)
+        val translated = chunks.mapNotNull { chunk ->
+            runCatching { Tasks.await(translator.translate(chunk)) }.getOrNull()
+        }.filter { it.isNotBlank() }.joinToString(" ")
+
+        return cleanArabic(translated.ifBlank { clean })
+    }
+
+    private fun chunkText(text: String, maxChars: Int): List<String> {
+        if (text.length <= maxChars) return listOf(text)
+        val sentences = text.split(Regex("(?<=[.!?؟…。！？])\\s*")).filter { it.isNotBlank() }
+        if (sentences.size <= 1) {
+            val words = text.split(Regex("\\s+"))
+            val chunks = mutableListOf<String>()
+            val current = StringBuilder()
+            words.forEach { word ->
+                if (current.length + word.length + 1 > maxChars && current.isNotEmpty()) {
+                    chunks.add(current.toString().trim()); current.clear()
+                }
+                current.append(word).append(' ')
+            }
+            if (current.isNotEmpty()) chunks.add(current.toString().trim())
+            return chunks.ifEmpty { listOf(text) }
+        }
+        val chunks = mutableListOf<String>()
+        val current = StringBuilder()
+        sentences.forEach { sentence ->
+            if (current.length + sentence.length + 1 > maxChars && current.isNotEmpty()) {
+                chunks.add(current.toString().trim()); current.clear()
+            }
+            current.append(sentence).append(' ')
+        }
+        if (current.isNotEmpty()) chunks.add(current.toString().trim())
+        return chunks
+    }
+
+    private fun cleanArabic(value: String): String = value
+        .replace('\u0640', ' ')
+        .replace(Regex("\\s+"), " ")
+        .replace('?', '؟')
+        .trim()
+
+    private fun applyGlossary(text: String, glossary: Map<String, String>): String {
+        if (glossary.isEmpty()) return text
+        var result = text
+        glossary.entries.sortedByDescending { it.key.length }.forEach { (s, t) ->
+            result = result.replace(s, t, ignoreCase = true)
+        }
+        return result
+    }
+
+    private fun inferEmotion(source: String): String {
+        val lower = source.lowercase(Locale.ROOT)
+        return when {
+            lower.count { it == '!' } >= 2 -> "انفعال"
+            lower.contains("...") || lower.contains("…") -> "تردد"
+            lower.contains('?') && lower.contains('!') -> "صدمة"
+            lower.contains('?') -> "تساؤل"
+            lower.contains('!') -> "تأكيد"
+            else -> ""
+        }
+    }
+
+    private fun translateViaOpenAI(
+        cues: MutableList<RawCue>,
+        config: TranslationConfig,
+        onProgress: (Int, Int) -> Unit
+    ) {
         if (config.endpoint.isBlank() || config.model.isBlank())
             throw TranslationException("محرك الترجمة السياقية غير مضبوط")
 
@@ -59,7 +213,7 @@ class TranslationEngine {
         chunks.forEachIndexed { index, chunk ->
             val before = if (index > 0) chunks[index - 1].takeLast(8).map { it.source } else emptyList()
             val after = if (index < chunks.size - 1) chunks[index + 1].take(4).map { it.source } else emptyList()
-            val results = translateChunk(chunk, before, after, config)
+            val results = translateChunkOpenAI(chunk, before, after, config)
             results.forEachIndexed { i, r ->
                 if (i < chunk.size) {
                     chunk[i].translated = r.translated
@@ -74,7 +228,7 @@ class TranslationEngine {
 
     private data class ChunkResult(val translated: String, val speaker: String, val emotion: String)
 
-    private fun translateChunk(
+    private fun translateChunkOpenAI(
         chunk: List<RawCue>,
         before: List<String>,
         after: List<String>,
